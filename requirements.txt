@@ -1,0 +1,11 @@
+nicegui
+fastapi
+uvicorn
+celery
+redis
+sqlalchemy
+pymysql
+pandas
+python-dotenv
+aiohttp
+openpyxl

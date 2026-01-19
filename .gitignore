@@ -1,0 +1,135 @@
+############################################
+# Python (NiceGUI / Celery) + Docker
+############################################
+
+# --- Secrets / env ---
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets.*
+secret.*
+config.local.*
+credentials.*
+**/local.settings.json
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Logs ---
+*.log
+logs/
+celerybeat-schedule
+celerybeat.pid
+
+# --- Temp / cache ---
+tmp/
+temp/
+.cache/
+*.tmp
+*.swp
+*.swo
+*~
+__pycache__/
+*.py[cod]
+*.pyd
+
+# --- Python envs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Python tooling ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+coverage/
+htmlcov/
+*.coverage
+*.cover
+*.egg-info/
+dist/
+build/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- NiceGUI / web build artifacts (safe defaults) ---
+# (NiceGUI mostly serves from python; leaving generic web caches)
+*.map
+
+# --- Celery (common runtime artifacts) ---
+celerybeat-schedule.*
+*.pid
+
+# --- Docker / compose runtime data ---
+docker-data/
+**/docker-data/
+volumes/
+**/volumes/
+*.pid.lock
+
+# If you use override files locally, ignore them:
+docker-compose.override.yml
+compose.override.yml
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.iml
+
+############################################
+# Data files: Excel / CSV handling
+############################################
+
+# If Excel/CSV are GENERATED outputs, ignore them:
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# If you want to KEEP sample/input data, put it under /data and unignore:
+!data/**/*.csv
+!data/**/*.xlsx
+!data/**/*.xls
+!data/**/*.xlsm
+
+############################################
+# JSON handling
+############################################
+
+# Ignore JSON everywhere by default (often outputs/config dumps):
+*.json
+
+# But KEEP JSONs that live in these directories:
+!jsons/**/*.json
+!data/**/*.json
+
+# Also keep package/lock JSONs if you ever add JS tooling:
+!package.json
+!package-lock.json
+!pnpm-lock.yaml
+!yarn.lock
+
+############################################
+# Local DBs / dumps (optional but common)
+############################################
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql
+
+############################################
+# Keep empty dirs if needed (optional)
+############################################
+# !**/.gitkeep
