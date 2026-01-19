@@ -1,43 +1,89 @@
 import json
 import re
-from datetime import datetime
 
 from app.enrichment_engine import EnrichmentEngine
 
 
 class ParserEngine:
     @staticmethod
-    def identify_format(json_data):
-        if isinstance(json_data, str):
+    def identify_format(data):
+        # 1. Safety Checks
+        if data is None:
+            return "EMPTY_DATA"
+
+        if isinstance(data, str):
             try:
-                json_data = json.loads(json_data)
+                data = json.loads(data)
             except:
                 return "INVALID_JSON"
-        if isinstance(json_data, list) and len(json_data) > 0:
-            return ParserEngine.identify_format(json_data[0])
-        data_str = str(json_data).lower()
-        if "ccrresponse" in data_str or "cirreportdatalst" in data_str:
-            return "Q_EXPERIAN_V2"
-        if "xmljsonresponse" in data_str:
+
+        if isinstance(data, list):
+            if len(data) > 0:
+                return ParserEngine.identify_format(data[0])
+            else:
+                return "EMPTY_LIST"
+
+        if not isinstance(data, dict):
+            return "UNKNOWN_FALLBACK"
+
+        # 2. Structural Checks (Safe Mode)
+
+        # A. Q Experian V2 (Fix: Check if data['data'] is actually a dict)
+        if (
+            "data" in data
+            and isinstance(data["data"], dict)
+            and "credit_report" in data["data"]
+        ):
+            if "CCRResponse" in data["data"]["credit_report"]:
+                return "Q_EXPERIAN_V2"
+            if "InquiryResponseHeader" in data["data"]["credit_report"]:
+                return "Q_EXPERIAN_V2"  # Added robust check
+
+        # B. Experian Raw
+        if "xmlJsonResponse" in data:
             return "EXPERIAN_RAW"
-        if "cibildata" in data_str and "getcustomerassetsresponse" in data_str:
-            return "TRUSTELL_CIBIL_RAW"
-        if "reportdata" in data_str and "reportsummary" in data_str:
+
+        # C. CPL Trustell
+        if "reportData" in data:
             return "CPL_TRUSTELL_CIBIL"
+        if (
+            "data" in data
+            and isinstance(data["data"], dict)
+            and "reportData" in data["data"]
+        ):
+            return "CPL_TRUSTELL_CIBIL"
+
+        # D. Trustell Cibil Raw
+        if "cibilData" in data:
+            return "TRUSTELL_CIBIL_RAW"
+        if (
+            "data" in data
+            and isinstance(data["data"], dict)
+            and "cibilData" in data["data"]
+        ):
+            return "TRUSTELL_CIBIL_RAW"
+
+        # E. Experian Internal
+        data_str = str(data).lower()
         if "creditanalysis" in data_str and "personalloans" in data_str:
             return "EXPERIAN_INTERNAL"
+
         return "UNKNOWN_FALLBACK"
 
     @staticmethod
     def parse(json_data, customer_id):
+        fmt = "INIT"  # <--- Fix: Initialize variable to prevent UnboundLocalError
         try:
+            # Standardization
             if isinstance(json_data, str):
                 try:
                     json_data = json.loads(json_data)
                 except:
                     return None, None, None
+
             if not json_data:
                 return None, None, None
+
             if isinstance(json_data, list):
                 all_l, all_lo, all_e = [], [], []
                 for item in json_data:
@@ -49,6 +95,8 @@ class ParserEngine:
                 return (all_l[0] if all_l else None), all_lo, all_e
 
             fmt = ParserEngine.identify_format(json_data)
+
+            # Parsing Logic
             if fmt == "Q_EXPERIAN_V2":
                 lead, loans, enqs = ParserEngine._parse_q_experian(
                     json_data, customer_id
@@ -74,30 +122,44 @@ class ParserEngine:
                     json_data, customer_id
                 )
 
+            # --- UNIVERSAL ENRICHMENT ---
             if lead:
                 pc = lead.get("Pincode")
                 city, state, zone = EnrichmentEngine.get_location(pc)
+                score = lead.get("CIBIL_Score", 0)
+                band = EnrichmentEngine.get_score_band(score)
+
                 lead["City_Mapped"] = city
                 lead["State_Mapped"] = state
                 lead["Zone_Mapped"] = zone
-                score = lead.get("CIBIL_Score", 0)
-                lead["CIBIL_Band"] = EnrichmentEngine.get_score_band(score)
+                lead["CIBIL_Band"] = band
+
                 common = {
                     "Customer_Name": lead.get("Full_Name"),
                     "PAN": lead.get("PAN"),
                     "Mobile": lead.get("Mobile"),
+                    "City_Mapped": city,
+                    "State_Mapped": state,
+                    "Zone_Mapped": zone,
+                    "CIBIL_Score": score,
+                    "CIBIL_Band": band,
                 }
+
                 for l in loans:
                     l.update(common)
                     l["Mapped_Category"] = EnrichmentEngine.get_standard_category(
                         l.get("Account_Type_Category")
                     )
+
                 for e in enqs:
                     e.update(common)
+
                 ParserEngine._inject_profile_glance(lead, loans)
+
             return lead, loans, enqs
         except Exception as e:
-            print(f"PARSER ERROR on {customer_id}: {str(e)}")
+            # Safe print that won't crash
+            print(f"PARSER ERROR on {customer_id} (Format: {fmt}): {str(e)}")
             return None, None, None
 
     @staticmethod
@@ -110,6 +172,7 @@ class ParserEngine:
             "Has_Credit_Card": "No",
             "Active_Trade_Count": 0,
         }
+        active_count = 0
         for l in loans:
             cat = l.get("Mapped_Category", "")
             if cat == "Home_Loans":
@@ -122,37 +185,53 @@ class ParserEngine:
                 glance["Has_Personal_Loan"] = "Yes"
             if cat == "Credit_Cards":
                 glance["Has_Credit_Card"] = "Yes"
+
             st = str(l.get("Status", "")).lower()
-            if "open" in st or "active" in st or "live" in st:
-                glance["Active_Trade_Count"] += 1
+            if "open" in st or "active" in st or "live" in st or st == "1":
+                active_count += 1
+
+        glance["Active_Trade_Count"] = active_count
+        total = len(loans)
+        lead["Total_Accounts"] = total
+        lead["Active_Accounts"] = active_count
+        lead["Closed_Accounts"] = total - active_count
         lead.update(glance)
 
+    # --- PARSERS ---
     @staticmethod
     def _parse_q_experian(data, cid):
+        base = data.get("data", data)
+        if not isinstance(base, dict):
+            return (
+                {"Customer_ID": cid, "Source": "Q_Invalid_Data"},
+                [],
+                [],
+            )  # Safety check
+
         root = _get_path(
-            data, "data.credit_report.CCRResponse.CIRReportDataLst[0].CIRReportData"
+            base, "credit_report.CCRResponse.CIRReportDataLst[0].CIRReportData"
         )
         if not root:
             return {"Customer_ID": cid, "Source": "Q_Exp_Error"}, [], []
+
         personal = root.get("IDAndContactInfo", {}).get("PersonalInfo", {})
         ids = root.get("IDAndContactInfo", {}).get("IdentityInfo", {})
         pan_val = _get_nested(ids, ["PANId", 0, "IdNumber"])
         addr_obj = _get_nested(root, ["IDAndContactInfo", "AddressInfo", 0])
         if not isinstance(addr_obj, dict):
             addr_obj = {}
+
         acc_details = root.get("RetailAccountDetails", [])
         if not isinstance(acc_details, list):
             acc_details = []
-        total_acc = len(acc_details)
-        active_acc = sum(
-            1 for x in acc_details if str(x.get("Open", "")).lower() == "yes"
-        )
+
         total_out = sum(_clean_numeric(x.get("Balance")) for x in acc_details)
+
         lead_info = {
             "Customer_ID": cid,
             "Full_Name": _get_nested(personal, ["Name", "FullName"]),
             "PAN": pan_val,
-            "Mobile": _get_path(data, "data.mobile"),
+            "Mobile": _get_path(base, "mobile"),
             "Email": _get_nested(
                 root, ["IDAndContactInfo", "EmailAddressInfo", 0, "EmailAddress"]
             ),
@@ -162,13 +241,12 @@ class ParserEngine:
             "Income": _clean_numeric(personal.get("TotalIncome")),
             "Address": addr_obj.get("Address"),
             "Pincode": addr_obj.get("Postal"),
-            "CIBIL_Score": _clean_numeric(_get_path(data, "data.credit_score")),
-            "Total_Accounts": total_acc,
-            "Active_Accounts": active_acc,
+            "CIBIL_Score": _clean_numeric(_get_path(base, "credit_score")),
             "Total_Outstanding": total_out,
             "Total_Sanctioned": 0.0,
             "Source": "Q_Experian_V2",
         }
+
         loans_list = []
         for item in acc_details:
             sanc = _clean_numeric(item.get("SanctionAmount"))
@@ -190,8 +268,9 @@ class ParserEngine:
                     "Payment_History_String": item.get("History48Months"),
                 }
             )
+
         enquiries_list = []
-        enq_root = _get_path(data, "data.credit_report.Enquiries")
+        enq_root = _get_path(base, "credit_report.Enquiries")
         if not isinstance(enq_root, list):
             enq_root = []
         for item in enq_root:
@@ -241,15 +320,6 @@ class ParserEngine:
             "Address": _format_address(addr),
             "Pincode": addr.get("pinCode"),
             "CIBIL_Score": _clean_numeric(safe(root, "score", "bureauScore")),
-            "Total_Accounts": _clean_numeric(
-                safe(cais, "creditAccount", "creditAccountTotal")
-            ),
-            "Active_Accounts": _clean_numeric(
-                safe(cais, "creditAccount", "creditAccountActive")
-            ),
-            "Closed_Accounts": _clean_numeric(
-                safe(cais, "creditAccount", "creditAccountClosed")
-            ),
             "Total_Outstanding": _clean_numeric(
                 safe(cais, "totalOutStandingBalance", "outstandingBalanceAll")
             ),
@@ -339,15 +409,6 @@ class ParserEngine:
             ),
             "CIBIL_Score": _clean_numeric(
                 _get_path(root, "reportSummary.creditScore.score")
-            ),
-            "Total_Accounts": _clean_numeric(
-                _get_path(root, "reportSummary.accountSummary.totalAccounts")
-            ),
-            "Active_Accounts": _clean_numeric(
-                _get_path(root, "reportSummary.accountSummary.openAccounts")
-            ),
-            "Closed_Accounts": _clean_numeric(
-                _get_path(root, "reportSummary.accountSummary.zeroBalanceAccounts")
             ),
             "Total_Outstanding": _clean_numeric(
                 _get_path(root, "reportSummary.accountSummary.totalBalanceAmount")
@@ -604,10 +665,9 @@ def _get_payment_history(node):
 def _clean_date(d_str):
     if not d_str:
         return ""
-    # Try common formats and return ISO
     for fmt in ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d"]:
         try:
             return datetime.strptime(str(d_str).split("T")[0], fmt).strftime("%Y-%m-%d")
         except:
             pass
-    return str(d_str)  # Return as-is if fail
+    return str(d_str)
