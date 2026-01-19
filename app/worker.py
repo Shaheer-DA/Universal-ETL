@@ -1,6 +1,7 @@
 import asyncio
 import os
 import traceback
+from datetime import datetime
 
 import aiohttp
 import pandas as pd
@@ -49,10 +50,12 @@ def run_etl_job(self, db_config, query_config):
         engine = get_db_engine(db_config)
         target = query_config["target_col"]
         date_col = query_config.get("date_col")
+        db_name = db_config.get("dbname", "UnknownDB")
+
+        # 1. SQL Construction
         date_select = (
             f", t1.{date_col} as record_date" if date_col else ", '' as record_date"
         )
-
         conds = []
         if query_config.get("filter_col") and query_config.get("filter_val"):
             alias = "t2" if query_config["use_join"] else "t1"
@@ -73,8 +76,11 @@ def run_etl_job(self, db_config, query_config):
             sql = f"SELECT t1.{query_config['single_id']} as customer_id {date_select}, t1.{target} as raw_data FROM {query_config['single_table']} t1 {where_sql}"
 
         all_leads, all_loans, all_enqs, all_analysis = [], [], [], []
+        total_fetched = 0
 
+        # 2. Fetch & Parse
         for chunk in pd.read_sql(sql, engine, chunksize=50):
+            total_fetched += len(chunk)
             if query_config.get("is_url_mode"):
                 base = query_config.get("base_url") or ""
                 urls = [base + str(x) for x in chunk["raw_data"]]
@@ -89,44 +95,139 @@ def run_etl_job(self, db_config, query_config):
                 cid = row["customer_id"]
                 r_date = str(row.get("record_date", ""))
                 l, lo, eq = ParserEngine.parse(row["json_object"], cid)
+
                 if l:
                     l["Record_Date"] = r_date
+                    l["Source_DB"] = db_name  # Add Source DB
                     all_leads.append(l)
+
                     for item in lo:
                         item["Record_Date"] = r_date
+                        item["Source_DB"] = db_name
+                    all_loans.extend(lo)
+
                     for item in eq:
                         item["Record_Date"] = r_date
-                    if eq:
-                        all_enqs.extend(eq)
-                    if lo:
-                        all_loans.extend(lo)
+                        item["Source_DB"] = db_name
+                    all_enqs.extend(eq)
+
                     try:
                         an_row = InsightEngine.generate_analytics(l, lo)
                         an_row["Record_Date"] = r_date
+                        an_row["Source_DB"] = db_name
                         all_analysis.append(an_row)
                     except:
                         pass
 
             self.update_state(
-                state="PROGRESS", meta={"status": f"Processed rows...", "progress": 50}
+                state="PROGRESS",
+                meta={
+                    "status": f"Fetched: {total_fetched} | Valid: {len(all_leads)}",
+                    "progress": 50,
+                },
             )
 
+        # 3. PROCESSING LAYER (Date Extraction & Deduplication)
         self.update_state(
-            state="PROGRESS", meta={"status": "Saving Excel...", "progress": 90}
+            state="PROGRESS", meta={"status": "Cleaning & Splitting...", "progress": 80}
         )
-        filename = f"Report_{self.request.id}.xlsx"
-        file_path = os.path.join("output", filename)
 
-        # --- Helper to Reorder Columns ---
-        def reorder(df):
+        # Helper to process a dataframe
+        def process_df(data_list, sort_keys, unique_keys, date_field_for_month=None):
+            if not data_list:
+                return pd.DataFrame(), pd.DataFrame()
+            df = pd.DataFrame(data_list)
+
+            # Date Extraction
+            if "Record_Date" in df.columns:
+                df["Record_Month"] = pd.to_datetime(
+                    df["Record_Date"], errors="coerce"
+                ).dt.strftime("%b-%Y")
+
+            if date_field_for_month and date_field_for_month in df.columns:
+                df["Loan_Start_Month"] = pd.to_datetime(
+                    df[date_field_for_month], errors="coerce"
+                ).dt.strftime("%b-%Y")
+
+            # Identify Duplicates
+            # We explicitly want to KEEP the first and mark others as dupes
+            if unique_keys:
+                duplicates = df[df.duplicated(subset=unique_keys, keep="first")]
+                clean = df.drop_duplicates(subset=unique_keys, keep="first")
+                return clean, duplicates
+            return df, pd.DataFrame()
+
+        # A. Leads
+        df_leads_clean, df_leads_dupe = process_df(
+            all_leads, ["Record_Date"], ["Customer_ID"]
+        )
+
+        # B. Analysis
+        df_an_clean, df_an_dupe = process_df(
+            all_analysis, ["Record_Date"], ["Customer_ID"]
+        )
+
+        # C. Loans (Unique by Customer + Account Number + Bank)
+        df_loans_clean, df_loans_dupe = process_df(
+            all_loans,
+            ["Record_Date"],
+            ["Customer_ID", "Account_Number", "Bank_Name"],
+            date_field_for_month="Date_Opened",
+        )
+
+        # D. Enquiries (Unique by Customer + Date + Lender + Amount)
+        df_enqs_clean, df_enqs_dupe = process_df(
+            all_enqs, ["Record_Date"], ["Customer_ID", "Date", "Lender", "Amount"]
+        )
+
+        # 4. EXCEL GENERATION
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        clean_filename = f"{db_name}_{timestamp}_Clean.xlsx"
+        dupe_filename = f"{db_name}_{timestamp}_Duplicates.xlsx"
+
+        clean_path = os.path.join("output", clean_filename)
+        dupe_path = os.path.join("output", dupe_filename)
+
+        # Column Ordering Definitions
+        lead_cols_start = [
+            "Customer_ID",
+            "Record_Date",
+            "Record_Month",
+            "Customer_Name",
+            "PAN",
+            "Mobile",
+        ]
+        lead_cols_end = ["Source_DB"]  # Source DB at the end
+
+        # Helper for Ordering
+        def strict_order(df, is_lead=False):
             if df.empty:
                 return df
             cols = list(df.columns)
-            # FORCE these columns to be first if they exist
-            start = ["Customer_ID", "Record_Date", "Customer_Name", "PAN", "Mobile"]
-            actual_start = [c for c in start if c in cols]
-            remaining = [c for c in cols if c not in actual_start]
-            return df[actual_start + remaining]
+
+            # Start
+            start_c = [c for c in lead_cols_start if c in cols]
+
+            # End (Source_DB)
+            end_c = [c for c in lead_cols_end if c in cols]
+
+            # Middle (Profile Glance first, then others)
+            glance_cols = [
+                "Has_Home_Loan",
+                "Has_Auto_Loan",
+                "Has_Credit_Card",
+                "Has_Business_Loan",
+                "Has_Personal_Loan",
+                "Active_Trade_Count",
+            ]
+            glance_c = [c for c in glance_cols if c in cols]
+
+            # The rest
+            used = set(start_c + end_c + glance_c)
+            middle_c = [c for c in cols if c not in used]
+
+            final_order = start_c + glance_c + middle_c + end_c
+            return df[final_order]
 
         SHEET_ORDER = [
             "Leads",
@@ -143,43 +244,58 @@ def run_etl_job(self, db_config, query_config):
             "Enquiries",
         ]
 
-        with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-            # 1. Leads (Use reorder to keep ALL cols)
-            pd.DataFrame(all_leads if all_leads else []).pipe(reorder).to_excel(
-                writer, sheet_name="Leads", index=False
-            )
+        # WRITE FUNCTION
+        def write_excel(path, d_leads, d_an, d_loans, d_enqs):
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                # Leads
+                d_leads.pipe(strict_order).to_excel(
+                    writer, sheet_name="Leads", index=False
+                )
+                # Analysis
+                d_an.pipe(strict_order).to_excel(
+                    writer, sheet_name="Lead_Analysis", index=False
+                )
 
-            # 2. Analysis
-            pd.DataFrame(all_analysis if all_analysis else []).pipe(reorder).to_excel(
-                writer, sheet_name="Lead_Analysis", index=False
-            )
+                # Buckets
+                buckets = {k: [] for k in SHEET_ORDER if "_Loans" in k or "_Cards" in k}
+                if not d_loans.empty:
+                    for _, loan in d_loans.iterrows():
+                        cat = loan.get("Mapped_Category", "Other_Loans")
+                        if cat in buckets:
+                            buckets[cat].append(loan)
+                        else:
+                            buckets["Other_Loans"].append(loan)
 
-            # 3. Loan Buckets
-            buckets = {k: [] for k in SHEET_ORDER if "_Loans" in k or "_Cards" in k}
-            for loan in all_loans:
-                cat = loan.get("Mapped_Category", "Other_Loans")
-                if cat in buckets:
-                    buckets[cat].append(loan)
-                else:
-                    buckets["Other_Loans"].append(loan)
+                for cat in buckets:
+                    if buckets[cat]:
+                        pd.DataFrame(buckets[cat]).pipe(strict_order).to_excel(
+                            writer, sheet_name=cat, index=False
+                        )
 
-            for cat in buckets:
-                if buckets[cat]:
-                    pd.DataFrame(buckets[cat]).pipe(reorder).to_excel(
-                        writer, sheet_name=cat, index=False
-                    )
+                # All Tradelines
+                d_loans.pipe(strict_order).to_excel(
+                    writer, sheet_name="All_Tradelines", index=False
+                )
+                # Enquiries
+                d_enqs.pipe(strict_order).to_excel(
+                    writer, sheet_name="Enquiries", index=False
+                )
 
-            pd.DataFrame(all_loans if all_loans else []).pipe(reorder).to_excel(
-                writer, sheet_name="All_Tradelines", index=False
-            )
-            pd.DataFrame(all_enqs if all_enqs else []).pipe(reorder).to_excel(
-                writer, sheet_name="Enquiries", index=False
+        # Generate BOTH files
+        write_excel(
+            clean_path, df_leads_clean, df_an_clean, df_loans_clean, df_enqs_clean
+        )
+        if not df_leads_dupe.empty or not df_loans_dupe.empty:
+            write_excel(
+                dupe_path, df_leads_dupe, df_an_dupe, df_loans_dupe, df_enqs_dupe
             )
 
         return {
             "status": "Completed",
-            "file_path": file_path,
-            "total_rows": len(all_leads),
+            "file_path": clean_path,
+            "dupe_path": dupe_path if os.path.exists(dupe_path) else None,
+            "total_rows": len(df_leads_clean),
+            "total_fetched": total_fetched,
         }
     except Exception as e:
         traceback.print_exc()

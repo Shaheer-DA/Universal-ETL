@@ -44,7 +44,6 @@ def init_ui():
             body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
             .nice-card { background: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
             .terminal-window { background-color: #0d1117; color: #58a6ff; font-family: 'JetBrains Mono', monospace; padding: 1rem; border-radius: 8px; height: 200px; overflow-y: auto; font-size: 0.8rem; }
-            
             .task-dock { position: fixed; bottom: 20px; right: 20px; width: 400px; z-index: 9999; transition: all 0.3s ease; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1); }
             .task-dock.minimized { width: 250px; bottom: 20px; height: 50px; overflow: hidden; }
             .dock-header { cursor: pointer; }
@@ -56,11 +55,10 @@ def init_ui():
         "bg-slate-900 h-16 flex items-center px-6 border-b border-slate-700"
     ):
         ui.icon("hub", size="28px").classes("text-blue-500 mr-3")
-        ui.label("UNIVERSAL ETL v16.3").classes(
+        ui.label("UNIVERSAL ETL v18.1").classes(
             "text-lg font-black text-white tracking-widest"
         )
 
-    # --- JOB STATUS DOCK ---
     with ui.card().classes(
         "task-dock hidden bg-white border border-slate-200"
     ) as job_dock:
@@ -74,7 +72,6 @@ def init_ui():
                 dock_title = ui.label("Processing...").classes(
                     "text-sm font-bold text-slate-700"
                 )
-
             with ui.row().classes("gap-1"):
                 ui.button(
                     icon="remove", on_click=lambda: job_dock.classes(add="minimized")
@@ -101,7 +98,6 @@ def init_ui():
                 .props("track-color=grey-3 color=blue-600")
             )
             dock_log = ui.log(max_lines=50).classes("terminal-window w-full h-32")
-
             with ui.row().classes("w-full justify-between pt-2"):
 
                 async def stop_job():
@@ -123,7 +119,6 @@ def init_ui():
                     "bg-green-600 text-white hidden w-1/2"
                 )
 
-    # --- DIALOGS ---
     with ui.dialog() as save_dialog, ui.card().classes("w-96"):
         ui.label("Save Configuration").classes("text-lg font-bold mb-2")
         p_name = ui.input("Preset Name").classes("w-full")
@@ -173,7 +168,6 @@ def init_ui():
             "w-full h-full overflow-auto p-4 text-xs"
         )
 
-    # --- MAIN PAGE ---
     with ui.row().classes("w-full max-w-7xl mx-auto p-6 gap-6"):
         with ui.column().classes("w-3/5 gap-4"):
             with ui.card().classes("nice-card w-full p-0 overflow-hidden"):
@@ -239,7 +233,6 @@ def init_ui():
                                                 f"Connection Failed: {e}",
                                                 type="negative",
                                             )
-
                                         if conf.get("use_join"):
                                             pt = conf.get("primary_table")
                                             st = conf.get("secondary_table")
@@ -284,7 +277,6 @@ def init_ui():
                                                     "single_id"
                                                 )
                                                 single_id_sel.update()
-
                                         json_col_sel.value = conf.get("target_col")
                                         filter_col_sel.value = conf.get("filter_col")
                                         filter_val.value = conf.get("filter_val")
@@ -547,7 +539,6 @@ def init_ui():
                     btn_inspect.disable()
 
                 async def start_job():
-                    # RESET DOCK
                     job_dock.classes(remove="hidden minimized")
                     dock_download.classes(add="hidden")
                     dock_status_icon.name = "sync"
@@ -587,16 +578,13 @@ def init_ui():
                     global current_task_id
                     task = run_etl_job.delay(db_conf, q_conf)
                     current_task_id = task.id
-
                     last_st = ""
-                    # --- CRITICAL FIX: TRY/EXCEPT LOOP ---
                     try:
                         while True:
                             if not current_task_id:
                                 break
                             await asyncio.sleep(0.5)
                             res = AsyncResult(task.id)
-
                             if res.state == "PROGRESS":
                                 st = res.info.get("status", "")
                                 if st != last_st:
@@ -607,7 +595,11 @@ def init_ui():
                                     res.info.get("progress", 0) / 100
                                 )
                             elif res.state == "SUCCESS":
-                                dock_log.push("✅ COMPLETE.")
+                                fetched = res.result.get("total_fetched", "?")
+                                valid = res.result.get("total_rows", 0)
+                                dock_log.push(
+                                    f"✅ DONE. Fetched: {fetched} | Valid: {valid}"
+                                )
                                 dock_title.text = "Success"
                                 dock_status_icon.name = "check_circle"
                                 dock_status_icon.classes(
@@ -620,8 +612,7 @@ def init_ui():
                                 )
                                 dock_download.classes(remove="hidden")
                                 add_to_history(
-                                    os.path.basename(res.result["file_path"]),
-                                    res.result["total_rows"],
+                                    os.path.basename(res.result["file_path"]), valid
                                 )
                                 history_list.refresh()
                                 current_task_id = None
@@ -637,7 +628,6 @@ def init_ui():
                                 current_task_id = None
                                 break
                     except RuntimeError:
-                        # Client disconnected. Exit loop silently.
                         return
 
                 btn_run = ui.button("START", on_click=start_job).classes(
@@ -716,4 +706,4 @@ def init_ui():
 
 init_ui()
 app.mount("/output", StaticFiles(directory="output"), name="output")
-ui.run(title="Universal ETL v16.3", reload=False, port=8080)
+ui.run(title="Universal ETL v18.1", reload=False, port=8080)

@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 
 from app.enrichment_engine import EnrichmentEngine
 
@@ -15,6 +16,8 @@ class ParserEngine:
         if isinstance(json_data, list) and len(json_data) > 0:
             return ParserEngine.identify_format(json_data[0])
         data_str = str(json_data).lower()
+        if "ccrresponse" in data_str or "cirreportdatalst" in data_str:
+            return "Q_EXPERIAN_V2"
         if "xmljsonresponse" in data_str:
             return "EXPERIAN_RAW"
         if "cibildata" in data_str and "getcustomerassetsresponse" in data_str:
@@ -46,7 +49,11 @@ class ParserEngine:
                 return (all_l[0] if all_l else None), all_lo, all_e
 
             fmt = ParserEngine.identify_format(json_data)
-            if fmt == "EXPERIAN_RAW":
+            if fmt == "Q_EXPERIAN_V2":
+                lead, loans, enqs = ParserEngine._parse_q_experian(
+                    json_data, customer_id
+                )
+            elif fmt == "EXPERIAN_RAW":
                 lead, loans, enqs = ParserEngine._parse_experian_raw(
                     json_data, customer_id
                 )
@@ -87,10 +94,117 @@ class ParserEngine:
                     )
                 for e in enqs:
                     e.update(common)
+                ParserEngine._inject_profile_glance(lead, loans)
             return lead, loans, enqs
         except Exception as e:
             print(f"PARSER ERROR on {customer_id}: {str(e)}")
             return None, None, None
+
+    @staticmethod
+    def _inject_profile_glance(lead, loans):
+        glance = {
+            "Has_Home_Loan": "No",
+            "Has_Auto_Loan": "No",
+            "Has_Business_Loan": "No",
+            "Has_Personal_Loan": "No",
+            "Has_Credit_Card": "No",
+            "Active_Trade_Count": 0,
+        }
+        for l in loans:
+            cat = l.get("Mapped_Category", "")
+            if cat == "Home_Loans":
+                glance["Has_Home_Loan"] = "Yes"
+            if cat == "Auto_Loans":
+                glance["Has_Auto_Loan"] = "Yes"
+            if cat == "Business_Loans":
+                glance["Has_Business_Loan"] = "Yes"
+            if cat == "Personal_Loans":
+                glance["Has_Personal_Loan"] = "Yes"
+            if cat == "Credit_Cards":
+                glance["Has_Credit_Card"] = "Yes"
+            st = str(l.get("Status", "")).lower()
+            if "open" in st or "active" in st or "live" in st:
+                glance["Active_Trade_Count"] += 1
+        lead.update(glance)
+
+    @staticmethod
+    def _parse_q_experian(data, cid):
+        root = _get_path(
+            data, "data.credit_report.CCRResponse.CIRReportDataLst[0].CIRReportData"
+        )
+        if not root:
+            return {"Customer_ID": cid, "Source": "Q_Exp_Error"}, [], []
+        personal = root.get("IDAndContactInfo", {}).get("PersonalInfo", {})
+        ids = root.get("IDAndContactInfo", {}).get("IdentityInfo", {})
+        pan_val = _get_nested(ids, ["PANId", 0, "IdNumber"])
+        addr_obj = _get_nested(root, ["IDAndContactInfo", "AddressInfo", 0])
+        if not isinstance(addr_obj, dict):
+            addr_obj = {}
+        acc_details = root.get("RetailAccountDetails", [])
+        if not isinstance(acc_details, list):
+            acc_details = []
+        total_acc = len(acc_details)
+        active_acc = sum(
+            1 for x in acc_details if str(x.get("Open", "")).lower() == "yes"
+        )
+        total_out = sum(_clean_numeric(x.get("Balance")) for x in acc_details)
+        lead_info = {
+            "Customer_ID": cid,
+            "Full_Name": _get_nested(personal, ["Name", "FullName"]),
+            "PAN": pan_val,
+            "Mobile": _get_path(data, "data.mobile"),
+            "Email": _get_nested(
+                root, ["IDAndContactInfo", "EmailAddressInfo", 0, "EmailAddress"]
+            ),
+            "Gender": personal.get("Gender"),
+            "DOB": personal.get("DateOfBirth"),
+            "Employment_Type": personal.get("Occupation"),
+            "Income": _clean_numeric(personal.get("TotalIncome")),
+            "Address": addr_obj.get("Address"),
+            "Pincode": addr_obj.get("Postal"),
+            "CIBIL_Score": _clean_numeric(_get_path(data, "data.credit_score")),
+            "Total_Accounts": total_acc,
+            "Active_Accounts": active_acc,
+            "Total_Outstanding": total_out,
+            "Total_Sanctioned": 0.0,
+            "Source": "Q_Experian_V2",
+        }
+        loans_list = []
+        for item in acc_details:
+            sanc = _clean_numeric(item.get("SanctionAmount"))
+            lead_info["Total_Sanctioned"] += sanc
+            loans_list.append(
+                {
+                    "Customer_ID": cid,
+                    "Account_Type_Category": item.get("AccountType"),
+                    "Bank_Name": item.get("Institution"),
+                    "Account_Number": item.get("AccountNumber"),
+                    "Status": item.get("AccountStatus"),
+                    "Sanctioned_Amount": sanc,
+                    "Current_Balance": _clean_numeric(item.get("Balance")),
+                    "EMI_Amount": _clean_numeric(item.get("InstallmentAmount")),
+                    "Date_Opened": _clean_date(item.get("DateOpened")),
+                    "Date_Closed": _clean_date(item.get("LastPaymentDate")),
+                    "Date_Reported": _clean_date(item.get("DateReported")),
+                    "Overdue_Amount": _clean_numeric(item.get("PastDueAmount")),
+                    "Payment_History_String": item.get("History48Months"),
+                }
+            )
+        enquiries_list = []
+        enq_root = _get_path(data, "data.credit_report.Enquiries")
+        if not isinstance(enq_root, list):
+            enq_root = []
+        for item in enq_root:
+            enquiries_list.append(
+                {
+                    "Customer_ID": cid,
+                    "Date": _clean_date(item.get("enquiryDate")),
+                    "Lender": item.get("memberShortName"),
+                    "Amount": _clean_numeric(item.get("enquiryAmount")),
+                    "Purpose": item.get("enquiryPurpose"),
+                }
+            )
+        return lead_info, loans_list, enquiries_list
 
     @staticmethod
     def _parse_experian_raw(data, cid):
@@ -114,7 +228,6 @@ class ParserEngine:
         if not isinstance(addr, dict):
             addr = {}
         cais = safe(root, "caisAccount", "caisSummary") or {}
-
         lead_info = {
             "Customer_ID": cid,
             "Full_Name": f"{applicant.get('firstName', '')} {applicant.get('lastName', '')}".strip(),
@@ -128,7 +241,6 @@ class ParserEngine:
             "Address": _format_address(addr),
             "Pincode": addr.get("pinCode"),
             "CIBIL_Score": _clean_numeric(safe(root, "score", "bureauScore")),
-            # STATS
             "Total_Accounts": _clean_numeric(
                 safe(cais, "creditAccount", "creditAccountTotal")
             ),
@@ -143,13 +255,12 @@ class ParserEngine:
             ),
             "Total_Sanctioned": 0.0,
             "Total_EMI": 0.0,
-            "Total_Past_Due": 0.0,  # Calculated via loop
+            "Total_Past_Due": 0.0,
             "Recent_Enquiries_30_Days": _clean_numeric(
                 safe(root, "caps", "capsSummary", "capsLast30Days")
             ),
             "Source": "Experian_Raw",
         }
-
         loans_list = []
         cais_list = safe(root, "caisAccount", "caisAccountDetails") or []
         if isinstance(cais_list, dict):
@@ -163,7 +274,6 @@ class ParserEngine:
             lead_info["Total_Sanctioned"] += sanc
             lead_info["Total_EMI"] += emi
             lead_info["Total_Past_Due"] += pdue
-
             loans_list.append(
                 {
                     "Customer_ID": cid,
@@ -174,9 +284,9 @@ class ParserEngine:
                     "Sanctioned_Amount": sanc,
                     "Current_Balance": _clean_numeric(item.get("currentBalance")),
                     "EMI_Amount": emi,
-                    "Date_Opened": item.get("openDate"),
-                    "Date_Closed": item.get("dateClosed"),
-                    "Date_Reported": item.get("dateReported"),
+                    "Date_Opened": _clean_date(item.get("openDate")),
+                    "Date_Closed": _clean_date(item.get("dateClosed")),
+                    "Date_Reported": _clean_date(item.get("dateReported")),
                     "Rate_Of_Interest": item.get("rateOfInterest"),
                     "Repayment_Tenure": item.get("repaymentTenure"),
                     "Overdue_Amount": pdue,
@@ -184,7 +294,6 @@ class ParserEngine:
                     "Payment_History_String": item.get("paymentHistoryProfile"),
                 }
             )
-
         enquiries_list = []
         caps_list = safe(root, "caps", "capsApplicationDetailList") or []
         if isinstance(caps_list, dict):
@@ -195,7 +304,7 @@ class ParserEngine:
             enquiries_list.append(
                 {
                     "Customer_ID": cid,
-                    "Date": item.get("dateOfRequest"),
+                    "Date": _clean_date(item.get("dateOfRequest")),
                     "Lender": item.get("subscriberName"),
                     "Amount": _clean_numeric(item.get("amountFinanced")),
                     "Purpose": item.get("financePurpose"),
@@ -273,9 +382,9 @@ class ParserEngine:
                 "Sanctioned_Amount": _clean_numeric(n.get("sanctionedAmount")),
                 "Current_Balance": _clean_numeric(n.get("outstanding")),
                 "EMI_Amount": _clean_numeric(n.get("emi")),
-                "Date_Opened": n.get("accountOpenDate"),
-                "Date_Closed": n.get("accountCloseDate"),
-                "Date_Reported": n.get("dateReported"),
+                "Date_Opened": _clean_date(n.get("accountOpenDate")),
+                "Date_Closed": _clean_date(n.get("accountCloseDate")),
+                "Date_Reported": _clean_date(n.get("dateReported")),
                 "Rate_Of_Interest": str(n.get("rateOfInterest", "")),
                 "Repayment_Tenure": str(n.get("repaymentTenure", "")),
                 "Overdue_Amount": _clean_numeric(n.get("accountPastDueAmount")),
@@ -298,7 +407,7 @@ class ParserEngine:
             enq_list.append(
                 {
                     "Customer_ID": cid,
-                    "Date": e.get("date"),
+                    "Date": _clean_date(e.get("date")),
                     "Lender": e.get("lender"),
                     "Amount": _clean_numeric(e.get("amount")),
                     "Purpose": e.get("purpose"),
@@ -350,9 +459,9 @@ class ParserEngine:
                     "Sanctioned_Amount": _clean_numeric(tl.get("highBalance")),
                     "Current_Balance": _clean_numeric(tl.get("currentBalance")),
                     "EMI_Amount": _clean_numeric(granted.get("EMIAmount")),
-                    "Date_Opened": tl.get("dateOpened"),
-                    "Date_Closed": tl.get("dateClosed"),
-                    "Date_Reported": tl.get("dateReported"),
+                    "Date_Opened": _clean_date(tl.get("dateOpened")),
+                    "Date_Closed": _clean_date(tl.get("dateClosed")),
+                    "Date_Reported": _clean_date(tl.get("dateReported")),
                     "Payment_History_String": _get_nested(
                         granted, ["PayStatusHistory", "status"]
                     ),
@@ -364,7 +473,7 @@ class ParserEngine:
             enq_list.append(
                 {
                     "Customer_ID": cid,
-                    "Date": inq.get("inquiryDate"),
+                    "Date": _clean_date(inq.get("inquiryDate")),
                     "Lender": inq.get("subscriberName"),
                     "Amount": _clean_numeric(inq.get("amount")),
                     "Purpose": inq.get("inquiryType"),
@@ -490,3 +599,15 @@ def _get_payment_history(node):
     if isinstance(ph, list):
         return ", ".join([str(x.get("status", "")) for x in ph])
     return str(ph)
+
+
+def _clean_date(d_str):
+    if not d_str:
+        return ""
+    # Try common formats and return ISO
+    for fmt in ["%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d"]:
+        try:
+            return datetime.strptime(str(d_str).split("T")[0], fmt).strftime("%Y-%m-%d")
+        except:
+            pass
+    return str(d_str)  # Return as-is if fail
