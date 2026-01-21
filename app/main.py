@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 
 import aiohttp
-import pandas as pd  # <--- CRITICAL FIX
+import pandas as pd
 from celery.result import AsyncResult
 from fastapi.staticfiles import StaticFiles
 from nicegui import app, ui
@@ -107,6 +107,7 @@ def init_ui():
     init_styles()
     ui.element("div").classes("bg-animation")
 
+    # --- HEADER ---
     with ui.header().classes(
         "bg-transparent h-20 flex items-center px-8 border-b border-white/10"
     ):
@@ -116,7 +117,7 @@ def init_ui():
                 ui.label("UNIVERSAL ETL").classes(
                     "text-2xl font-black text-white neon-text leading-none"
                 )
-                ui.label("v20.2 • CYBERPUNK EDITION").classes(
+                ui.label("v21.0 • ENTERPRISE EDITION").classes(
                     "text-xs text-purple-400 font-mono tracking-widest"
                 )
         ui.space()
@@ -125,6 +126,7 @@ def init_ui():
             on_click=lambda: ui.notify("Settings Locked", type="warning"),
         ).props("flat round color=grey")
 
+    # --- DOCK ---
     with ui.card().classes("task-dock hidden") as job_dock:
         with ui.row().classes(
             "dock-header w-full justify-between items-center bg-slate-900 p-3 border-b border-slate-800"
@@ -185,6 +187,7 @@ def init_ui():
                     "bg-emerald-600 text-white flex-grow hidden shadow-[0_0_15px_rgba(16,185,129,0.4)]"
                 )
 
+    # --- SAVE DIALOG ---
     with ui.dialog() as save_dialog, ui.card().classes("glass-card w-96 p-6"):
         ui.label("ENCRYPT CONFIGURATION").classes(
             "text-lg font-bold text-white mb-4 tracking-widest"
@@ -219,6 +222,8 @@ def init_ui():
                 "date_col": date_col_sel.value,
                 "is_url_mode": is_s3.value,
                 "base_url": base_url.value,
+                "pan_col": pan_col_sel.value,
+                "mobile_col": mobile_col_sel.value,
             }
             PresetManager.save_preset(p_name.value, p_desc.value, config_dump)
             ui.notify("Configuration Saved.", type="positive", icon="save")
@@ -229,7 +234,10 @@ def init_ui():
             "w-full bg-purple-600 text-white font-bold"
         )
 
+    # --- MAIN LAYOUT ---
     with ui.row().classes("w-full max-w-[1600px] mx-auto p-8 gap-8"):
+
+        # LEFT COLUMN
         with ui.column().classes("w-2/3 gap-6"):
             with ui.card().classes("glass-card w-full p-0 overflow-hidden"):
                 with ui.tabs().classes("w-full text-slate-400 bg-black/20") as tabs:
@@ -297,18 +305,32 @@ def init_ui():
                                             return ui.notify(
                                                 f"Link Failure: {e}", type="negative"
                                             )
+
                                         if conf.get("use_join"):
                                             pt = conf.get("primary_table")
                                             st = conf.get("secondary_table")
                                             if pt in tables:
                                                 p_table_sel.value = pt
                                                 p_table_sel.update()
-                                                p_col_sel.options = get_columns(eng, pt)
+                                                cols = get_columns(eng, pt)
+                                                p_col_sel.options = cols
                                                 p_col_sel.update()
+                                                pan_col_sel.options = cols
+                                                pan_col_sel.update()
+                                                mobile_col_sel.options = cols
+                                                mobile_col_sel.update()
+
                                                 p_col_sel.value = conf.get(
                                                     "primary_col"
                                                 )
                                                 p_col_sel.update()
+                                                pan_col_sel.value = conf.get("pan_col")
+                                                pan_col_sel.update()
+                                                mobile_col_sel.value = conf.get(
+                                                    "mobile_col"
+                                                )
+                                                mobile_col_sel.update()
+
                                             if st in tables:
                                                 s_table_sel.value = st
                                                 s_table_sel.update()
@@ -339,6 +361,7 @@ def init_ui():
                                                     "single_id"
                                                 )
                                                 single_id_sel.update()
+
                                         json_col_sel.value = conf.get("target_col")
                                         filter_col_sel.value = conf.get("filter_col")
                                         filter_val.value = conf.get("filter_val")
@@ -355,6 +378,7 @@ def init_ui():
                                             )
                                             date_col_sel.update()
                                             date_col_sel.value = conf.get("date_col")
+
                                         ui.notify(
                                             "SYSTEM READY.",
                                             type="positive",
@@ -468,6 +492,7 @@ def init_ui():
                     except:
                         pass
 
+                # --- JOIN MODE WITH PAN/MOBILE ---
                 with ui.grid(columns=2).bind_visibility_from(
                     mode_group, "value", value=True
                 ).classes("w-full gap-4"):
@@ -477,9 +502,25 @@ def init_ui():
                     p_col_sel = ui.select(
                         [], label="Primary Key", with_input=True
                     ).props("dark outlined dense options-dense behavior=menu")
-                    p_table_sel.on_value_change(
-                        lambda e: on_table_select(e, [p_col_sel])
+
+                    # New Columns
+                    pan_col_sel = ui.select(
+                        [], label="DB PAN Column (Opt)", with_input=True
+                    ).props(
+                        "dark outlined dense options-dense behavior=menu label-color=orange"
                     )
+                    mobile_col_sel = ui.select(
+                        [], label="DB Mobile Column (Opt)", with_input=True
+                    ).props(
+                        "dark outlined dense options-dense behavior=menu label-color=orange"
+                    )
+
+                    p_table_sel.on_value_change(
+                        lambda e: on_table_select(
+                            e, [p_col_sel, pan_col_sel, mobile_col_sel]
+                        )
+                    )
+
                     s_table_sel = ui.select(
                         [], label="JSON Table", with_input=True
                     ).props("dark outlined dense options-dense behavior=menu")
@@ -491,6 +532,7 @@ def init_ui():
                             e, [s_col_sel, json_col_sel, filter_col_sel]
                         )
                     )
+
                 with ui.grid(columns=2).bind_visibility_from(
                     mode_group, "value", value=False
                 ).classes("w-full gap-4"):
@@ -505,6 +547,7 @@ def init_ui():
                             e, [single_id_sel, json_col_sel, filter_col_sel]
                         )
                     )
+
                 ui.separator().classes("my-6 opacity-20")
                 with ui.grid(columns=3).classes("w-full gap-4"):
                     json_col_sel = ui.select(
@@ -514,6 +557,7 @@ def init_ui():
                         [], label="Filter Column", with_input=True
                     ).props("dark outlined dense")
                     filter_val = ui.input("Filter Value").props("dark outlined dense")
+
                 with ui.expansion("ADVANCED PROTOCOLS", icon="code").classes(
                     "w-full mt-4 text-slate-400"
                 ):
@@ -545,6 +589,7 @@ def init_ui():
                         "dark outlined dense type=date"
                     )
 
+        # RIGHT COLUMN
         with ui.column().classes("w-1/3 gap-6"):
             with ui.card().classes("glass-card w-full p-6 flex flex-col gap-4"):
                 ui.label("COMMAND CENTER").classes(
@@ -653,6 +698,8 @@ def init_ui():
                         "end_date": end_date.value,
                         "is_url_mode": is_s3.value,
                         "base_url": base_url.value,
+                        "pan_col": pan_col_sel.value,
+                        "mobile_col": mobile_col_sel.value,  # PASS NEW COLS
                     }
                     global current_task_id
                     task = run_etl_job.delay(db_conf, q_conf)
@@ -674,27 +721,51 @@ def init_ui():
                                     res.info.get("progress", 0) / 100
                                 )
                             elif res.state == "SUCCESS":
-                                fetched = res.result.get("total_fetched", "?")
-                                valid = res.result.get("total_rows", 0)
-                                dock_log.push(
-                                    f"✅ SEQUENCE COMPLETE. IN: {fetched} | OUT: {valid}"
-                                )
-                                dock_title.text = "JOB COMPLETE"
-                                dock_status_icon.classes(
-                                    remove="animate-pulse text-cyan-400",
-                                    add="text-green-500",
-                                )
-                                dock_progress.set_value(1)
-                                dock_download.props(
-                                    f'href=/output/{os.path.basename(res.result["file_path"])}'
-                                )
-                                dock_download.classes(remove="hidden")
-                                add_to_history(
-                                    os.path.basename(res.result["file_path"]), valid
-                                )
-                                history_list.refresh()
-                                current_task_id = None
-                                break
+                                result = res.result
+                                if (
+                                    isinstance(result, dict)
+                                    and result.get("status") == "Completed"
+                                ):
+                                    fetched = result.get("total_fetched", "?")
+                                    valid = result.get("total_rows", 0)
+                                    employees = result.get("employees_found", 0)
+
+                                    dock_log.push(
+                                        f"✅ COMPLETE. IN: {fetched} | VALID: {valid} | EMP: {employees}"
+                                    )
+                                    dock_title.text = "JOB COMPLETE"
+                                    dock_status_icon.classes(
+                                        remove="animate-pulse text-cyan-400",
+                                        add="text-green-500",
+                                    )
+                                    dock_progress.set_value(1)
+
+                                    # Safe File Path Access
+                                    fp = result.get("file_path")
+                                    if fp and os.path.exists(fp):
+                                        dock_download.props(
+                                            f"href=/output/{os.path.basename(fp)}"
+                                        )
+                                        dock_download.classes(remove="hidden")
+                                        add_to_history(os.path.basename(fp), valid)
+                                        history_list.refresh()
+
+                                    current_task_id = None
+                                    break
+                                else:
+                                    err = (
+                                        result.get("error", "Unknown Error")
+                                        if isinstance(result, dict)
+                                        else str(result)
+                                    )
+                                    dock_log.push(f"❌ WORKER ERROR: {err}")
+                                    dock_title.text = "FAILED"
+                                    dock_status_icon.classes(
+                                        remove="animate-pulse text-cyan-400",
+                                        add="text-red-500",
+                                    )
+                                    current_task_id = None
+                                    break
                             elif res.state == "FAILURE" or res.state == "REVOKED":
                                 dock_log.push(f"❌ CRITICAL FAILURE: {str(res.result)}")
                                 dock_title.text = "FAILED"
@@ -735,6 +806,8 @@ def init_ui():
                             "date_col": date_col_sel.value,
                             "is_url_mode": is_s3.value,
                             "base_url": base_url.value,
+                            "pan_col": pan_col_sel.value,
+                            "mobile_col": mobile_col_sel.value,
                         }
                         old_data = PresetManager.load_presets()[current_preset_id]
                         PresetManager.save_preset(
@@ -789,4 +862,4 @@ def init_ui():
 
 init_ui()
 app.mount("/output", StaticFiles(directory="output"), name="output")
-ui.run(title="Universal ETL v20.2", reload=False, port=8080)
+ui.run(title="Universal ETL v21.0", reload=False, port=8080)
