@@ -1,5 +1,9 @@
 import asyncio
+import glob
+import math
 import os
+import shutil
+import time
 import traceback
 from datetime import datetime
 
@@ -7,11 +11,19 @@ import aiohttp
 import pandas as pd
 from celery import Celery
 
-from app.cleaner_engine import CleanerEngine  # <--- IMPORT NEW ENGINE
-from app.database import get_db_engine
+from app.cleaner_engine import CleanerEngine
+from app.database import get_columns, get_db_engine
 from app.enrichment_engine import EnrichmentEngine
 from app.insight_engine import InsightEngine
 from app.parser_engine import ParserEngine
+
+# --- STARTUP ---
+print("--- WORKER STARTUP: Loading Masters... ---")
+try:
+    EnrichmentEngine.load_masters()
+    print("--- WORKER STARTUP: Masters Loaded. Ready. ---")
+except Exception as e:
+    print(f"--- WORKER STARTUP ERROR: {e} ---")
 
 celery_app = Celery(
     "etl_worker", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0"
@@ -23,6 +35,7 @@ def cancel_task(task_id):
     return True
 
 
+# --- 1. ENABLED URL FETCHER (FIXED) ---
 async def fetch_url(session, url):
     try:
         async with session.get(url, timeout=15, ssl=False) as response:
@@ -30,11 +43,11 @@ async def fetch_url(session, url):
                 try:
                     return await response.json()
                 except:
-                    return {"error": "INVALID_JSON"}
+                    return {"error": "INVALID_JSON_CONTENT", "url": url}
             else:
-                return {"error": f"HTTP_{response.status}"}
-    except:
-        return {"error": "FETCH_FAIL"}
+                return {"error": f"HTTP_{response.status}", "url": url}
+    except Exception as e:
+        return {"error": f"FETCH_FAIL: {str(e)}", "url": url}
 
 
 async def fetch_batch_urls(urls):
@@ -46,76 +59,126 @@ async def fetch_batch_urls(urls):
 @celery_app.task(bind=True)
 def run_etl_job(self, db_config, query_config):
     self.update_state(
-        state="PROGRESS", meta={"status": "Connecting to DB...", "progress": 0}
+        state="PROGRESS", meta={"status": "Initializing...", "progress": 0}
     )
+    print(f"[{self.request.id}] JOB STARTED.")
 
-    # Initialize Engines
     cleaner = CleanerEngine()
-    EnrichmentEngine.load_masters()  # Ensure masters are loaded
+    temp_dir = os.path.join(".temp_data", self.request.id)
+    os.makedirs(temp_dir, exist_ok=True)
 
     try:
+        print(f"[{self.request.id}] Connecting to DB...")
         engine = get_db_engine(db_config)
         target = query_config["target_col"]
         date_col = query_config.get("date_col")
-        db_name = db_config.get("dbname", "UnknownDB")
-
-        # 1. SQL Construction
-        select_clause = (
-            f"t1.{query_config['primary_col']} as customer_id, t2.{target} as raw_data"
-        )
-        if date_col:
-            select_clause += f", t1.{date_col} as record_date"
-        else:
-            select_clause += ", '' as record_date"
-
         pan_col = query_config.get("pan_col")
         mob_col = query_config.get("mobile_col")
-        if pan_col:
-            select_clause += f", t1.{pan_col} as db_pan"
-        else:
-            select_clause += ", '' as db_pan"
-        if mob_col:
-            select_clause += f", t1.{mob_col} as db_mobile"
-        else:
-            select_clause += ", '' as db_mobile"
+        db_name = db_config.get("dbname", "UnknownDB")
+
+        # Schema
+        p_cols = []
+        try:
+            p_cols = get_columns(engine, query_config["primary_table"])
+        except:
+            pass
+
+        def get_alias(col_name):
+            if not col_name:
+                return None
+            if col_name in p_cols:
+                return f"t1.{col_name}"
+            return f"t2.{col_name}"
+
+        # SQL
+        select_cols = (
+            f"t1.{query_config['primary_col']} as customer_id, t2.{target} as raw_data"
+        )
+        date_sql = get_alias(date_col)
+        select_cols += (
+            f", {date_sql} as record_date" if date_sql else ", '' as record_date"
+        )
+        pan_sql = get_alias(pan_col)
+        select_cols += f", {pan_sql} as db_pan" if pan_sql else ", '' as db_pan"
+        mob_sql = get_alias(mob_col)
+        select_cols += f", {mob_sql} as db_mobile" if mob_sql else ", '' as db_mobile"
 
         conds = []
         if query_config.get("filter_col") and query_config.get("filter_val"):
-            alias = "t2" if query_config["use_join"] else "t1"
-            conds.append(
-                f"{alias}.{query_config['filter_col']} = '{query_config['filter_val']}'"
-            )
+            f_col = query_config["filter_col"]
+            f_alias = "t1" if f_col in p_cols else "t2"
+            conds.append(f"{f_alias}.{f_col} = '{query_config['filter_val']}'")
         if date_col and query_config.get("start_date") and query_config.get("end_date"):
-            alias = "t1"
+            d_alias = "t1" if date_col in p_cols else "t2"
             conds.append(
-                f"{alias}.{date_col} BETWEEN '{query_config['start_date']} 00:00:00' AND '{query_config['end_date']} 23:59:59'"
+                f"{d_alias}.{date_col} BETWEEN '{query_config['start_date']} 00:00:00' AND '{query_config['end_date']} 23:59:59'"
             )
-        where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+        where_clause = ("WHERE " + " AND ".join(conds)) if conds else ""
 
         if query_config["use_join"]:
-            sql = f"SELECT {select_clause} FROM {query_config['primary_table']} t1 JOIN {query_config['secondary_table']} t2 ON t1.{query_config['primary_col']} = t2.{query_config['secondary_col']} {where_sql}"
+            base_from = f"FROM {query_config['primary_table']} t1 JOIN {query_config['secondary_table']} t2 ON t1.{query_config['primary_col']} = t2.{query_config['secondary_col']}"
         else:
-            sql = f"SELECT t1.{query_config['single_id']} as customer_id, t1.{target} as raw_data {date_select.replace('t1.','')} FROM {query_config['single_table']} t1 {where_sql}"
+            base_from = f"FROM {query_config['single_table']} t1"
 
-        all_leads, all_loans, all_enqs, all_analysis = [], [], [], []
+        # Count
+        print(f"[{self.request.id}] Counting rows...")
+        count_sql = f"SELECT COUNT(*) {base_from} {where_clause}"
+        self.update_state(
+            state="PROGRESS", meta={"status": "Calculating Workload...", "progress": 5}
+        )
+        try:
+            total_records = pd.read_sql(count_sql, engine).iloc[0, 0]
+        except:
+            total_records = 0
+        print(f"[{self.request.id}] Total Rows: {total_records}")
+
+        BATCH_SIZE = 1000
+        num_batches = math.ceil(total_records / BATCH_SIZE) if total_records > 0 else 1
         total_fetched = 0
 
-        # 2. Fetch & Parse Loop
-        for chunk in pd.read_sql(sql, engine, chunksize=50):
+        # LOOP
+        for i in range(num_batches):
+            batch_leads, batch_loans, batch_enqs, batch_analysis = [], [], [], []
+            offset = i * BATCH_SIZE
+            paginated_sql = f"SELECT {select_cols} {base_from} {where_clause} ORDER BY t1.{query_config['primary_col']} LIMIT {BATCH_SIZE} OFFSET {offset}"
+
+            try:
+                chunk = pd.read_sql(paginated_sql, engine)
+            except Exception as e:
+                print(f"Batch {i} error: {e}")
+                continue
+
+            if chunk.empty:
+                break
             total_fetched += len(chunk)
+
+            # --- 2. DOWNLOAD MODE LOGIC ---
             if query_config.get("is_url_mode"):
                 base = query_config.get("base_url") or ""
-                urls = [base + str(x) for x in chunk["raw_data"]]
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                chunk["json_object"] = loop.run_until_complete(fetch_batch_urls(urls))
-                loop.close()
+                # Construct URLs safely
+                urls = [base + str(x).strip() for x in chunk["raw_data"]]
+
+                # Fetch Async
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    fetched_data = loop.run_until_complete(fetch_batch_urls(urls))
+                    loop.close()
+                    chunk["json_object"] = fetched_data
+                except Exception as e:
+                    print(f"Batch {i} Fetch Error: {e}")
+                    chunk["json_object"] = [None] * len(
+                        chunk
+                    )  # Fallback to avoid crash
             else:
                 chunk["json_object"] = chunk["raw_data"]
 
+            # Parse
             for _, row in chunk.iterrows():
                 cid = row["customer_id"]
                 r_date = str(row.get("record_date", ""))
+
                 l, lo, eq = ParserEngine.parse(row["json_object"], cid)
 
                 if l:
@@ -123,10 +186,9 @@ def run_etl_job(self, db_config, query_config):
                         l["PAN"] = str(row["db_pan"])
                     if row.get("db_mobile"):
                         l["Mobile"] = str(row["db_mobile"])
-
                     l["Record_Date"] = r_date
                     l["Source_DB"] = db_name
-                    all_leads.append(l)
+                    batch_leads.append(l)
 
                     common = {
                         "Record_Date": r_date,
@@ -136,101 +198,137 @@ def run_etl_job(self, db_config, query_config):
                     }
                     for item in lo:
                         item.update(common)
-                    all_loans.extend(lo)
+                    batch_loans.extend(lo)
                     for item in eq:
                         item.update(common)
-                    all_enqs.extend(eq)
+                    batch_enqs.extend(eq)
                     try:
                         an_row = InsightEngine.generate_analytics(l, lo)
                         an_row.update(common)
-                        all_analysis.append(an_row)
+                        batch_analysis.append(an_row)
                     except:
                         pass
+
+            if batch_leads:
+                pd.DataFrame(batch_leads).to_pickle(f"{temp_dir}/leads_{i}.pkl")
+            if batch_loans:
+                pd.DataFrame(batch_loans).to_pickle(f"{temp_dir}/loans_{i}.pkl")
+            if batch_enqs:
+                pd.DataFrame(batch_enqs).to_pickle(f"{temp_dir}/enqs_{i}.pkl")
+            if batch_analysis:
+                pd.DataFrame(batch_analysis).to_pickle(f"{temp_dir}/analysis_{i}.pkl")
+
+            prog = 10 + int((i / num_batches) * 60)
             self.update_state(
                 state="PROGRESS",
                 meta={
-                    "status": f"Fetched: {total_fetched} | Valid: {len(all_leads)}",
-                    "progress": 50,
+                    "status": f"Processing Batch {i+1}/{num_batches}...",
+                    "progress": prog,
                 },
             )
 
-        # 3. CLEANER ENGINE EXECUTION
+        # MERGE
+        print(f"[{self.request.id}] Merging Checkpoints...")
         self.update_state(
-            state="PROGRESS",
-            meta={"status": "Running Cleaner Engine...", "progress": 80},
+            state="PROGRESS", meta={"status": "Merging & Cleaning...", "progress": 80}
         )
 
-        # A. Process Leads (Sort -> Filter Emp -> Dedupe)
+        def load_merged(prefix):
+            files = glob.glob(f"{temp_dir}/{prefix}_*.pkl")
+            if not files:
+                return []
+            return pd.concat(
+                [pd.read_pickle(f) for f in files], ignore_index=True
+            ).to_dict("records")
+
+        all_leads = load_merged("leads")
+        all_loans = load_merged("loans")
+        all_enqs = load_merged("enqs")
+        all_analysis = load_merged("analysis")
+
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+        # CLEAN
         df_leads_clean, df_leads_emp, df_leads_dupe = cleaner.process_leads(all_leads)
 
-        # Helper to extract month
-        def add_month(df, col="Record_Date", target="Record_Month"):
-            if not df.empty and col in df.columns:
-                df[target] = pd.to_datetime(df[col], errors="coerce").dt.strftime(
-                    "%b-%Y"
-                )
+        def add_meta(df):
+            if df.empty:
+                return df
+            if "Record_Date" in df.columns:
+                df["Record_Month"] = pd.to_datetime(
+                    df["Record_Date"], errors="coerce"
+                ).dt.strftime("%b-%Y")
             return df
 
-        # Add months to leads
-        df_leads_clean = add_month(df_leads_clean)
-        df_leads_emp = add_month(df_leads_emp)
+        df_leads_clean = add_meta(df_leads_clean)
+        if not df_leads_clean.empty:
+            df_leads_clean.insert(0, "S.No", range(1, 1 + len(df_leads_clean)))
 
-        # B. Process Sub-Sheets (Strict Deduplication on Loans)
         valid_ids = (
             set(df_leads_clean["Customer_ID"]) if not df_leads_clean.empty else set()
         )
 
-        # Deduplicate Loans: Customer + Account + Bank (Fixes identical duplicates)
         df_loans_clean = cleaner.clean_sub_sheet(
             all_loans,
             valid_ids,
             unique_keys=["Customer_ID", "Account_Number", "Bank_Name"],
         )
-        df_loans_clean = add_month(df_loans_clean, "Date_Opened", "Loan_Start_Month")
+        if not df_loans_clean.empty and "Date_Opened" in df_loans_clean.columns:
+            df_loans_clean["Loan_Start_Month"] = pd.to_datetime(
+                df_loans_clean["Date_Opened"], errors="coerce"
+            ).dt.strftime("%b-%Y")
 
-        # Deduplicate Enquiries: Customer + Date + Lender + Amount
         df_enqs_clean = cleaner.clean_sub_sheet(
             all_enqs, valid_ids, unique_keys=["Customer_ID", "Date", "Lender", "Amount"]
         )
-
-        # Deduplicate Analysis: Customer ID only
         df_an_clean = cleaner.clean_sub_sheet(
             all_analysis, valid_ids, unique_keys=["Customer_ID"]
         )
 
-        # C. Update Tracker with Category stats
         cleaner.calculate_category_stats(df_loans_clean)
         df_tracker = cleaner.get_tracker_df()
 
-        # D. Process Duplicates/Excluded for the second file
-        # (We dump the 'garbage' there)
-        # Note: We don't spend too much time cleaning the garbage, just dumping it.
-        # But we must define the variables to avoid NameError
-        df_an_dupe = pd.DataFrame()  # Placeholder or implement if strictly needed
-        df_loans_dupe = pd.DataFrame()
-        df_enqs_dupe = pd.DataFrame()
-
+        excluded_ids = set()
         if not df_leads_dupe.empty:
-            dupe_ids = set(df_leads_dupe["Customer_ID"])
+            excluded_ids.update(df_leads_dupe["Customer_ID"])
+        if not df_leads_emp.empty:
+            excluded_ids.update(df_leads_emp["Customer_ID"])
+
+        df_an_dupe, df_loans_dupe, df_enqs_dupe = (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+        if excluded_ids:
             df_loans_dupe = cleaner.clean_sub_sheet(
                 all_loans,
-                dupe_ids,
+                excluded_ids,
                 unique_keys=["Customer_ID", "Account_Number", "Bank_Name"],
             )
-            df_enqs_dupe = cleaner.clean_sub_sheet(all_enqs, dupe_ids, unique_keys=None)
+            df_enqs_dupe = cleaner.clean_sub_sheet(
+                all_enqs, excluded_ids, unique_keys=None
+            )
             df_an_dupe = cleaner.clean_sub_sheet(
-                all_analysis, dupe_ids, unique_keys=["Customer_ID"]
+                all_analysis, excluded_ids, unique_keys=["Customer_ID"]
             )
 
-        # 4. EXCEL WRITING
+        # WRITING
+        print(f"[{self.request.id}] Writing Excel...")
+        self.update_state(
+            state="PROGRESS", meta={"status": "Writing Excel...", "progress": 90}
+        )
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         clean_filename = f"{db_name}_{timestamp}_Clean.xlsx"
         dupe_filename = f"{db_name}_{timestamp}_Excluded.xlsx"
         clean_path = os.path.join("output", clean_filename)
         dupe_path = os.path.join("output", dupe_filename)
 
-        # Strict Columns
         lead_order = [
+            "S.No",
             "Customer_ID",
             "Record_Date",
             "Record_Month",
@@ -265,9 +363,9 @@ def run_etl_job(self, db_config, query_config):
                 return df
             cols = list(df.columns)
             if target_cols:
-                return df[[c for c in target_cols if c in cols]]
+                existing = [c for c in target_cols if c in cols]
+                return df[existing]
 
-            # General ordering for other sheets
             start_c = [
                 "Customer_ID",
                 "Record_Date",
@@ -287,10 +385,7 @@ def run_etl_job(self, db_config, query_config):
             end = ["Source_DB"] if "Source_DB" in cols else []
             return df[actual_start + middle + end]
 
-        SHEET_ORDER = [
-            "Processing_Tracker",
-            "Leads",
-            "Lead_Analysis",
+        LOAN_BUCKETS = [
             "Home_Loans",
             "Personal_Loans",
             "Business_Loans",
@@ -298,59 +393,49 @@ def run_etl_job(self, db_config, query_config):
             "Credit_Cards",
             "Education_Loans",
             "Gold_Loans",
-            "Other_Loans",
-            "All_Tradelines",
-            "Enquiries",
         ]
 
-        def write_file(path, d_leads, d_an, d_loans, d_enqs, d_track=None, d_emp=None):
-            with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                # 1. Tracker (First Sheet if exists)
+        def write_file(path, d_l, d_a, d_lo, d_e, d_track=None, d_emp=None):
+            with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
                 if d_track is not None and not d_track.empty:
                     d_track.to_excel(
                         writer, sheet_name="Processing_Tracker", index=False
                     )
 
-                # 2. Leads
-                d_leads.pipe(strict_format, target_cols=lead_order).to_excel(
+                d_l.pipe(strict_format, target_cols=lead_order).to_excel(
                     writer, sheet_name="Leads", index=False
                 )
 
-                # 3. Employees (Only in Excluded file)
                 if d_emp is not None and not d_emp.empty:
                     d_emp.pipe(strict_format, target_cols=lead_order).to_excel(
                         writer, sheet_name="Internal_Employees", index=False
                     )
 
-                # 4. Analysis
-                d_an.pipe(strict_format).to_excel(
+                d_a.pipe(strict_format).to_excel(
                     writer, sheet_name="Lead_Analysis", index=False
                 )
 
-                # 5. Loan Buckets
-                buckets = {k: [] for k in SHEET_ORDER if "_Loans" in k or "_Cards" in k}
-                if not d_loans.empty:
-                    for _, row in d_loans.iterrows():
-                        cat = row.get("Mapped_Category", "Other_Loans")
-                        if cat in buckets:
-                            buckets[cat].append(row)
-                        else:
-                            buckets["Other_Loans"].append(row)
+                if not d_lo.empty:
+                    for bucket in LOAN_BUCKETS:
+                        subset = d_lo[d_lo["Mapped_Category"] == bucket]
+                        if not subset.empty:
+                            subset.pipe(strict_format).to_excel(
+                                writer, sheet_name=bucket, index=False
+                            )
 
-                for cat in buckets:
-                    if buckets[cat]:
-                        pd.DataFrame(buckets[cat]).pipe(strict_format).to_excel(
-                            writer, sheet_name=cat, index=False
+                    others = d_lo[~d_lo["Mapped_Category"].isin(LOAN_BUCKETS)]
+                    if not others.empty:
+                        others.pipe(strict_format).to_excel(
+                            writer, sheet_name="Other_Loans", index=False
                         )
 
-                d_loans.pipe(strict_format).to_excel(
+                d_lo.pipe(strict_format).to_excel(
                     writer, sheet_name="All_Tradelines", index=False
                 )
-                d_enqs.pipe(strict_format).to_excel(
+                d_e.pipe(strict_format).to_excel(
                     writer, sheet_name="Enquiries", index=False
                 )
 
-        # WRITE CLEAN
         write_file(
             clean_path,
             df_leads_clean,
@@ -360,20 +445,22 @@ def run_etl_job(self, db_config, query_config):
             d_track=df_tracker,
         )
 
-        # WRITE EXCLUDED (If needed)
-        has_dupes = not df_leads_dupe.empty
-        has_emps = not df_leads_emp.empty
+        has_data = (not df_leads_dupe.empty) or (not df_leads_emp.empty)
+        if has_data:
+            df_emp = pd.DataFrame(df_leads_emp)
+            if not df_emp.empty:
+                df_emp = add_meta(df_emp)
+                if "S.No" not in df_emp.columns:
+                    df_emp.insert(0, "S.No", range(1, 1 + len(df_emp)))
 
-        if has_dupes or has_emps:
             write_file(
                 dupe_path,
                 df_leads_dupe,
                 df_an_dupe,
                 df_loans_dupe,
                 df_enqs_dupe,
-                d_emp=df_leads_emp,
+                d_emp=df_emp,
             )
-
             return {
                 "status": "Completed",
                 "file_path": clean_path,
